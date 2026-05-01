@@ -2540,6 +2540,7 @@ const T3X3_TABLES = {
   pistas:'t3x3_pistas',
   monitores:'t3x3_monitores',
   partidos:'t3x3_partidos',
+  slots:'t3x3_slots',
   actas:'t3x3_actas',
   integraciones:'t3x3_integraciones'
 };
@@ -2550,11 +2551,12 @@ const T3X3_SHEETS_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRZ
 let t3x3Loaded = false;
 let t3x3Remote = false;
 let t3x3RemoteWarned = false;
+let t3x3RemoteTables = {};
 let t3x3CurrentTab = 'resumen';
 let t3x3CompetitionTab = 'clasificaciones';
 let t3x3ActiveTorneoId = null;
 let t3x3ModalPlayers = [];
-let t3x3State = { torneos:[], equipos:[], jugadores:[], pistas:[], monitores:[], partidos:[], actas:[], integraciones:[] };
+let t3x3State = { torneos:[], equipos:[], jugadores:[], pistas:[], monitores:[], partidos:[], slots:[], actas:[], integraciones:[] };
 let t3x3ActaTimerInterval = null;
 let t3x3SignaturePads = {};
 
@@ -2569,13 +2571,14 @@ function t3x3Players(teamId){ return t3x3State.jugadores.filter(j=>j.equipo_id==
 function t3x3Matches(cat){ const tid=t3x3ActiveTorneo()?.id; return t3x3State.partidos.filter(p=>(!tid || p.torneo_id===tid) && (!cat || p.categoria===cat)); }
 function t3x3Pistas(){ const tid=t3x3ActiveTorneo()?.id; return t3x3State.pistas.filter(p=>!tid || p.torneo_id===tid); }
 function t3x3Monitores(){ const tid=t3x3ActiveTorneo()?.id; return t3x3State.monitores.filter(m=>!tid || m.torneo_id===tid); }
+function t3x3CalendarPersistsRemote(){ return !!(t3x3Remote && t3x3RemoteTables.slots && t3x3RemoteTables.partidos); }
 
 function t3x3LoadLocal(){
   try {
     const raw = JSON.parse(localStorage.getItem(T3X3_LOCAL_KEY) || '{}');
-    t3x3State = { torneos:[], equipos:[], jugadores:[], pistas:[], monitores:[], partidos:[], actas:[], integraciones:[], ...raw };
+    t3x3State = { torneos:[], equipos:[], jugadores:[], pistas:[], monitores:[], partidos:[], slots:[], actas:[], integraciones:[], ...raw };
   } catch(_) {
-    t3x3State = { torneos:[], equipos:[], jugadores:[], pistas:[], monitores:[], partidos:[], actas:[], integraciones:[] };
+    t3x3State = { torneos:[], equipos:[], jugadores:[], pistas:[], monitores:[], partidos:[], slots:[], actas:[], integraciones:[] };
   }
 }
 function t3x3SaveLocal(){ localStorage.setItem(T3X3_LOCAL_KEY, JSON.stringify(t3x3State)); }
@@ -2623,14 +2626,32 @@ function t3x3EnsureDefaults(){
 }
 async function t3x3TryRemoteLoad(){
   const loaded = {};
+  t3x3RemoteTables = {};
+  let availableCount = 0;
   for(const key of Object.keys(T3X3_TABLES)){
-    const { data, error } = await sb.from(T3X3_TABLES[key]).select('*');
-    if(error) return false;
-    loaded[key] = data || [];
+    const tableName = T3X3_TABLES[key];
+    try {
+      const { data, error } = await sb.from(tableName).select('*');
+      if(error){
+        console.warn('3X3 tabla no disponible', key, error);
+        t3x3RemoteTables[key] = false;
+        continue;
+      }
+      loaded[key] = data || [];
+      t3x3RemoteTables[key] = true;
+      availableCount++;
+    } catch(err) {
+      console.warn('3X3 tabla inaccesible', key, err);
+      t3x3RemoteTables[key] = false;
+    }
   }
-  t3x3State = { ...t3x3State, ...loaded };
-  t3x3Remote = true;
-  return true;
+  if(availableCount){
+    t3x3State = { ...t3x3State, ...loaded };
+    t3x3Remote = true;
+    return true;
+  }
+  t3x3Remote = false;
+  return false;
 }
 async function loadT3X3(force=false){
   if(t3x3Loaded && !force){ renderT3X3(); return; }
@@ -2646,9 +2667,18 @@ async function loadT3X3(force=false){
   }
   t3x3EnsureDefaults();
   if(t3x3Remote){
-    for(const t of t3x3State.torneos) await sb.from(T3X3_TABLES.torneos).upsert(t);
-    for(const p of t3x3State.pistas) await sb.from(T3X3_TABLES.pistas).upsert(p);
-    for(const i of t3x3State.integraciones) await sb.from(T3X3_TABLES.integraciones).upsert(i);
+    if(t3x3RemoteTables.torneos){
+      for(const t of t3x3State.torneos) await sb.from(T3X3_TABLES.torneos).upsert(t);
+    }
+    if(t3x3RemoteTables.pistas){
+      for(const p of t3x3State.pistas) await sb.from(T3X3_TABLES.pistas).upsert(p);
+    }
+    if(t3x3RemoteTables.integraciones){
+      for(const i of t3x3State.integraciones) await sb.from(T3X3_TABLES.integraciones).upsert(i);
+    }
+    if(t3x3RemoteTables.slots){
+      for(const s of (t3x3State.slots||[])) await sb.from(T3X3_TABLES.slots).upsert(s);
+    }
   }
   t3x3SaveLocal();
   t3x3Loaded = true;
@@ -2678,15 +2708,26 @@ async function t3x3DeleteEquipo(id){
 }
 async function t3x3Upsert(key, item){
   t3x3SaveLocal();
-  if(!t3x3Remote) return;
+  if(!t3x3Remote || !T3X3_TABLES[key] || !t3x3RemoteTables[key]) return false;
   const { error } = await sb.from(T3X3_TABLES[key]).upsert(item);
-  if(error){ console.warn('3X3 upsert fallback', key, error); t3x3Remote = false; }
+  if(error){
+    console.warn('3X3 upsert fallback', key, error);
+    t3x3RemoteTables[key] = false;
+    if(key==='slots' || key==='partidos') showToast('⚠️ Calendario 3X3 no se ha guardado en Supabase');
+    return false;
+  }
+  return true;
 }
 async function t3x3Delete(key, id){
   t3x3SaveLocal();
-  if(!t3x3Remote) return;
+  if(!t3x3Remote || !T3X3_TABLES[key] || !t3x3RemoteTables[key]) return false;
   const { error } = await sb.from(T3X3_TABLES[key]).delete().eq('id', id);
-  if(error){ console.warn('3X3 delete fallback', key, error); t3x3Remote = false; }
+  if(error){
+    console.warn('3X3 delete fallback', key, error);
+    t3x3RemoteTables[key] = false;
+    return false;
+  }
+  return true;
 }
 
 function t3x3Age(nacimiento){
@@ -8666,6 +8707,7 @@ window.addEventListener('resize', function(){
     }
     t3x3SaveLocal();
     showToast(created ? `✅ Parrilla generada: ${created} huecos` : 'ℹ️ La parrilla ya estaba creada');
+    if(!t3x3CalendarPersistsRemote()) showToast('⚠️ La parrilla no se está guardando en Supabase');
     renderT3X3();
   };
 
@@ -8784,6 +8826,7 @@ window.addEventListener('resize', function(){
     }
     t3x3SaveLocal();
     showToast(assigned ? `✅ ${assigned} partidos autoasignados${skipped?` · ${skipped} pendientes sin hueco válido`:''}` : '⚠️ No se pudo asignar ningún partido con las reglas actuales');
+    if(!t3x3CalendarPersistsRemote()) showToast('⚠️ El calendario sigue en modo local');
     renderT3X3();
   };
 
@@ -8856,7 +8899,7 @@ window.addEventListener('resize', function(){
       s.updated_at=new Date().toISOString();
       await t3x3Upsert('slots', s);
     }
-    t3x3SaveLocal(); showToast(`✅ Plantilla aplicada a ${pista.nombre}`); renderT3X3();
+    t3x3SaveLocal(); showToast(`✅ Plantilla aplicada a ${pista.nombre}`); if(!t3x3CalendarPersistsRemote()) showToast('⚠️ La plantilla no se ha guardado en Supabase'); renderT3X3();
   };
 
   window.t3x3ClearSlot = async function(slotId){
@@ -8893,7 +8936,7 @@ window.addEventListener('resize', function(){
       <button class="btn btn-primary can-edit" onclick="t3x3GeneratePlannerSlots(false)">Generar parrilla</button>
       <button class="btn btn-secondary can-edit" onclick="t3x3GeneratePlannerSlots(true)">Regenerar día</button>
       <button class="btn btn-secondary can-edit" onclick="t3x3AutoAsignarPendientes()">Autoasignar pendientes</button>
-    </div>`;
+    </div>${t3x3CalendarPersistsRemote() ? '<div class="cp-callout ok" style="margin-top:10px;">☁️ Calendario 3X3 guardando en Supabase</div>' : '<div class="cp-callout warn" style="margin-top:10px;">⚠️ Calendario 3X3 en modo local: los cambios pueden perderse al cerrar</div>'}`;
     if(!slots.length){
       board.innerHTML=control+`<div class="empty-state"><div class="icon">🗓️</div><p>Genera una parrilla de 20 minutos para el día. Quedará vacía y lista para asignar partidos y monitores.</p></div>${t3x3PendingPanel(pending)}`;
       return;
