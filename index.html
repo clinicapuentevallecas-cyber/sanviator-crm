@@ -1624,6 +1624,36 @@ function buildInscritoIdentity(i){
   if(nombre && tel) return 'nt:' + nombre + '|' + tel;
   return 'n:' + nombre;
 }
+const JUGADO_ANTERIOR_CACHE_KEY = 'sv_pruebas_jugado_anterior_cache_v1';
+function getJugadoAnteriorCache(){
+  try { return JSON.parse(localStorage.getItem(JUGADO_ANTERIOR_CACHE_KEY) || '{}'); }
+  catch(_) { return {}; }
+}
+function setJugadoAnteriorCache(map){
+  try { localStorage.setItem(JUGADO_ANTERIOR_CACHE_KEY, JSON.stringify(map || {})); } catch(_) {}
+}
+function setJugadoAnteriorForInscrito(item, value){
+  const val = String(value || '').trim();
+  const key = buildInscritoIdentity(item || {});
+  if(!key) return;
+  const cache = getJugadoAnteriorCache();
+  if(val) cache[key] = val;
+  else delete cache[key];
+  setJugadoAnteriorCache(cache);
+}
+function getJugadoAnteriorForInscrito(item){
+  if(item && (item.jugadoAnterior || item.jugadoAnteriorDonde)) return item.jugadoAnterior || item.jugadoAnteriorDonde || '';
+  const key = buildInscritoIdentity(item || {});
+  if(!key) return '';
+  const cache = getJugadoAnteriorCache();
+  return cache[key] || '';
+}
+function hydrateJugadoAnteriorInInscritos(){
+  inscritos = (inscritos || []).map(x => {
+    const extra = getJugadoAnteriorForInscrito(x);
+    return extra ? { ...x, jugadoAnterior: x.jugadoAnterior || x.jugadoAnteriorDonde || extra } : x;
+  });
+}
 function getPendingSheetInscritos(){ try { const arr = JSON.parse(localStorage.getItem(PENDING_SHEETS_KEY) || '[]'); return Array.isArray(arr) ? arr : []; } catch(_){ return []; } }
 function setPendingSheetInscritos(arr){ localStorage.setItem(PENDING_SHEETS_KEY, JSON.stringify(Array.isArray(arr) ? arr : [])); }
 function savePendingSheetInscrito(item){
@@ -1688,6 +1718,7 @@ function sanitizeInscritoForDB(raw){
     asiste: raw && raw.asiste !== undefined ? raw.asiste : null,
     nacimiento: raw && raw.nacimiento || '',
     notas: raw && raw.notas || '',
+    jugadoAnterior: raw && (raw.jugadoAnterior || raw.jugadoAnteriorDonde) || '',
     fecha: normalizeInscritoFechaForDB(raw && raw.fecha)
   };
   Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k]);
@@ -2036,16 +2067,19 @@ async function loadInscritos() {
   const { data, error } = await sb.from('inscritos').select('*, comentarios(*)').order('fecha', { ascending: false });
   if (error) { console.error(error); return; }
   inscritos = data || [];
+  hydrateJugadoAnteriorInInscritos();
   // Reinyectar siempre los deportistas del club y sus overrides locales
   // después de cualquier recarga desde Supabase para que no desaparezcan
   // de Lista/Kanban/Equipos al guardar un inscrito normal.
   mergeSocios();
+  hydrateJugadoAnteriorInInscritos();
   syncPruebasCategoryFilterOptions();
 }
 
 
 async function saveInscrito(obj) {
   const { comentarios, ...data } = obj;
+  setJugadoAnteriorForInscrito(obj || data, data.jugadoAnterior || data.jugadoAnteriorDonde || '');
   if (data.id && !data.id.includes('-new')) {
     const { error } = await sb.from('inscritos').update({ ...data, updated_at: new Date().toISOString() }).eq('id', data.id);
     if (error) { showToast('❌ Error al guardar'); console.error(error); return false; }
@@ -2086,6 +2120,7 @@ async function saveComentario(inscritoId, texto) {
       seguir: item.seguir || null,
       nacimiento: item.nacimiento || '',
       notas: item.notas || '',
+      jugadoAnterior: item.jugadoAnterior || item.jugadoAnteriorDonde || '',
       esDelClub: !!item.esDelClub,
       equipoClub: item.equipoClub || '',
       fecha: item.fecha || new Date().toISOString()
@@ -2418,6 +2453,19 @@ function parseCSVLine(line) {
   r.push(cur.trim()); return r;
 }
 
+function normalizeCsvHeader(v){
+  return String(v||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/gi,' ').trim().toLowerCase();
+}
+function findCsvColumn(headers, aliases, fallbackIndex){
+  const normHeaders = (headers||[]).map(normalizeCsvHeader);
+  const aliasList = (aliases||[]).map(normalizeCsvHeader);
+  for(const alias of aliasList){
+    const idx = normHeaders.indexOf(alias);
+    if(idx >= 0) return idx;
+  }
+  return Number.isInteger(fallbackIndex) ? fallbackIndex : -1;
+}
+
 async function syncFromSheets() {
   const btn=document.getElementById('sync-btn');
   if(btn){btn.textContent='⏳...';btn.disabled=true;}
@@ -2427,6 +2475,16 @@ async function syncFromSheets() {
     const text=await res.text();
     const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l);
     if(lines.length<2){showToast('⚠️ Hoja vacía');return;}
+    const headers = parseCSVLine(lines[0]);
+    const idxTimestamp = findCsvColumn(headers, ['Marca temporal','Timestamp'], 0);
+    const idxEmail = findCsvColumn(headers, ['Dirección de correo electrónico','Correo electrónico','Email'], 1);
+    const idxNombre = findCsvColumn(headers, ['Nombre y Apellidos del Jugador','Nombre y apellidos','Nombre'], 3);
+    const idxTelefono = findCsvColumn(headers, ['Teléfono','Teléfono de contacto','Teléfono del Padre','Telefono del Padre'], 4);
+    const idxTutor = findCsvColumn(headers, ['Tutor','Nombre del padre','Padre/Madre o tutor'], 5);
+    const idxDeporte = findCsvColumn(headers, ['Deporte'], 6);
+    const idxNacimiento = findCsvColumn(headers, ['Fecha de nacimiento','Nacimiento'], 7);
+    const idxNotas = findCsvColumn(headers, ['Observaciones','Observaciones a tener en cuenta (en caso de haberlas)','Alergias, fobias, medicaciones...'], 8);
+    const idxJugadoAnterior = findCsvColumn(headers, ['¿Has jugado anteriormente? ¿Donde?','Has jugado anteriormente donde','Has jugado anteriormente','Donde jugo la temporada pasada'], -1);
 
     let nuevos=0, actualizados=0, pendientes=0;
     const importedAt = new Date().toISOString();
@@ -2435,30 +2493,33 @@ async function syncFromSheets() {
     for(let i=1;i<lines.length;i++){
       const v=parseCSVLine(lines[i]);
       const g=(idx)=>(idx>=0&&v[idx])?v[idx].trim():'';
-      const nombre=g(3); if(!nombre) continue;
-      const email=g(1);
-      const telefono=g(4);
-      const tutor=g(5);
-      const deporte=normDeporte(g(6));
-      const nac=g(7);
-      const notas=g(8);
+      const nombre=g(idxNombre); if(!nombre) continue;
+      const email=g(idxEmail);
+      const telefono=g(idxTelefono);
+      const tutor=g(idxTutor);
+      const deporte=normDeporte(g(idxDeporte));
+      const nac=g(idxNacimiento);
+      const notas=g(idxNotas);
+      const jugadoAnterior = g(idxJugadoAnterior);
       let fecha=importedAt;
-      const ts=g(0); if(ts){const p=new Date(ts);if(!isNaN(p))fecha=p.toISOString();}
+      const ts=g(idxTimestamp); if(ts){const p=new Date(ts);if(!isNaN(p))fecha=p.toISOString();}
 
       const baseRecord = {
         nombre, email, telefono, tutor, deporte,
         genero: detectarGenero(nombre),
         categoria: calcularCategoria(nac,deporte),
         nacimiento: nac,
-        notas, fecha,
+        notas, jugadoAnterior, fecha,
         estado:'Nuevo', equipo:'', asiste:null, seguir:null
       };
+      if(jugadoAnterior) setJugadoAnteriorForInscrito(baseRecord, jugadoAnterior);
 
       const existente = inscritos.find(x => buildInscritoIdentity(x)===buildInscritoIdentity(baseRecord) && !String(x.id||'').startsWith('club_'));
       const record = existente ? Object.assign({}, existente, baseRecord, {
         genero: existente.genero || baseRecord.genero,
         categoria: existente.categoria || baseRecord.categoria,
         notas: baseRecord.notas || existente.notas,
+        jugadoAnterior: baseRecord.jugadoAnterior || existente.jugadoAnterior || existente.jugadoAnteriorDonde || '',
         nacimiento: baseRecord.nacimiento || existente.nacimiento,
         fecha: baseRecord.fecha || existente.fecha
       }) : baseRecord;
@@ -2505,18 +2566,30 @@ function importCSV(event) {
   reader.onload=async (e)=>{
     const lines=e.target.result.split('\n').map(l=>l.trim()).filter(l=>l);
     if(lines.length<2){showToast('⚠️ CSV vacío');return;}
+    const headers = parseCSVLine(lines[0]);
+    const idxTimestamp = findCsvColumn(headers, ['Marca temporal','Timestamp'], 0);
+    const idxEmail = findCsvColumn(headers, ['Dirección de correo electrónico','Correo electrónico','Email'], 1);
+    const idxNombre = findCsvColumn(headers, ['Nombre y Apellidos del Jugador','Nombre y apellidos','Nombre'], 3);
+    const idxTelefono = findCsvColumn(headers, ['Teléfono','Teléfono de contacto','Teléfono del Padre','Telefono del Padre'], 4);
+    const idxTutor = findCsvColumn(headers, ['Tutor','Nombre del padre','Padre/Madre o tutor'], 5);
+    const idxDeporte = findCsvColumn(headers, ['Deporte'], 6);
+    const idxNacimiento = findCsvColumn(headers, ['Fecha de nacimiento','Nacimiento'], 7);
+    const idxNotas = findCsvColumn(headers, ['Observaciones','Observaciones a tener en cuenta (en caso de haberlas)','Alergias, fobias, medicaciones...'], 8);
+    const idxJugadoAnterior = findCsvColumn(headers, ['¿Has jugado anteriormente? ¿Donde?','Has jugado anteriormente donde','Has jugado anteriormente','Donde jugo la temporada pasada'], -1);
     const toInsert=[];
     for(let i=1;i<lines.length;i++){
       const v=parseCSVLine(lines[i]);
       const g=(idx)=>(idx>=0&&v[idx])?v[idx].trim():'';
-      const nombre=g(3); if(!nombre) continue;
-      const email=g(1);
+      const nombre=g(idxNombre); if(!nombre) continue;
+      const email=g(idxEmail);
       if(inscritos.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase()&&(x.email||'').toLowerCase()===email.toLowerCase())) continue;
       let fecha=new Date().toISOString();
-      const ts=g(0); if(ts){const p=new Date(ts);if(!isNaN(p))fecha=p.toISOString();}
-      const deporte=normDeporte(g(6));
-      const nac=g(7);
-      toInsert.push({nombre,email,telefono:g(4),tutor:g(5),deporte,genero:detectarGenero(nombre),categoria:calcularCategoria(nac,deporte),nacimiento:nac,estado:'Nuevo',equipo:'',asiste:null,notas:g(8),fecha});
+      const ts=g(idxTimestamp); if(ts){const p=new Date(ts);if(!isNaN(p))fecha=p.toISOString();}
+      const deporte=normDeporte(g(idxDeporte));
+      const nac=g(idxNacimiento);
+      const nuevoInscrito={nombre,email,telefono:g(idxTelefono),tutor:g(idxTutor),deporte,genero:detectarGenero(nombre),categoria:calcularCategoria(nac,deporte),nacimiento:nac,estado:'Nuevo',equipo:'',asiste:null,notas:g(idxNotas),jugadoAnterior:g(idxJugadoAnterior),fecha};
+      if(nuevoInscrito.jugadoAnterior) setJugadoAnteriorForInscrito(nuevoInscrito, nuevoInscrito.jugadoAnterior);
+      toInsert.push(nuevoInscrito);
     }
     if(toInsert.length){
       await sb.from('inscritos').insert(toInsert);
@@ -4198,6 +4271,10 @@ function openDetail(id){
         </select>
       </div>
     </div>` : ''}
+    <div style="background:#eef6ff;border-radius:8px;padding:10px 12px;margin-bottom:12px;border-left:4px solid var(--azul);">
+      <div style="font-size:9.5px;text-transform:uppercase;letter-spacing:1px;color:var(--gris-medio);font-weight:700;">🕘 ¿Has jugado anteriormente? ¿Dónde?</div>
+      <div style="font-weight:700;font-size:13px;margin-top:4px;">${t3x3Esc(getJugadoAnteriorForInscrito(i) || '—')}</div>
+    </div>
     ${canEdit?`
     <div class="detail-row">
       <div class="detail-field"><label>Deporte</label>
@@ -4230,10 +4307,17 @@ function openDetail(id){
           <option value="false" ${i.asiste===false?'selected':''}>❌ No asiste</option>
         </select>
       </div>
+    </div>`:
+    <div class="detail-row">
+      <div class="detail-field">
+        <label>¿Has jugado anteriormente? ¿Dónde?</label>
+        <input type="text" id="e-jugado-anterior" value="${t3x3Esc(getJugadoAnteriorForInscrito(i) || '')}" placeholder="Club o equipo de la temporada pasada">
+      </div>
     </div>`:`
     <div style="background:var(--gris-bg);border-radius:8px;padding:12px;margin-bottom:12px;font-size:13px;">
       <div><strong>Categoría:</strong> ${i.categoria} &nbsp;|&nbsp; <strong>Estado:</strong> ${i.estado}</div>
       <div style="margin-top:4px"><strong>Fecha nac.:</strong> ${i.nacimiento||'—'} &nbsp;|&nbsp; <strong>Equipo:</strong> ${i.equipo||'—'}</div>
+      <div style="margin-top:4px"><strong>¿Has jugado anteriormente? ¿Dónde?:</strong> ${t3x3Esc(getJugadoAnteriorForInscrito(i) || '—')}</div>
     </div>
     <div class="detail-row">
       <div class="detail-field"><label>Categoría (editable)</label>
@@ -4297,7 +4381,8 @@ async function saveEdit(){
     estado:      getVal('e-estado')    || i.estado,
     equipo:      equiVal !== null ? equiVal : i.equipo,
     asiste:      av===''?null:av==='true',
-    seguir:      getVal('e-seguir') !== null ? (getVal('e-seguir') || null) : (i.seguir || null)
+    seguir:      getVal('e-seguir') !== null ? (getVal('e-seguir') || null) : (i.seguir || null),
+    jugadoAnterior: getVal('e-jugado-anterior') !== null ? getVal('e-jugado-anterior').trim() : (i.jugadoAnterior || i.jugadoAnteriorDonde || '')
   };
   const btn = document.querySelector('#modal-footer .btn-primary');
   if(btn){ btn.textContent='⏳ Guardando...'; btn.disabled=true; }
