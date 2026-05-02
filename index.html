@@ -1121,7 +1121,7 @@ pre,code{white-space:pre-wrap;}
             <option value="">Todas las categorías</option>
             <option>Benjamín</option><option>Alevín</option><option>Infantil</option>
             <option>Cadete</option><option>Juvenil</option><option>Junior</option>
-            <option>Sub-22</option><option>Senior</option>
+            <option>Senior</option>
           </select>
           <select class="filter-select" id="f-estado" onchange="renderView()">
             <option value="">Todos los estados</option>
@@ -1688,6 +1688,7 @@ function sanitizeInscritoForDB(raw){
     asiste: raw && raw.asiste !== undefined ? raw.asiste : null,
     nacimiento: raw && raw.nacimiento || '',
     notas: raw && raw.notas || '',
+    jugado_anterior: raw && (raw.jugado_anterior || raw.jugadoAnterior || raw.jugadoAnteriorDonde) || '',
     fecha: normalizeInscritoFechaForDB(raw && raw.fecha)
   };
   Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k]);
@@ -1738,12 +1739,64 @@ async function upsertSingleInscrito(raw, preferredId){
   }
 }
 
-const CAT_ORDER = ['Benjamín','Alevín','Infantil','Cadete','Juvenil','Junior','Sub-22','Senior'];
+async function directPersistInscritoFallback(raw, preferredId){
+  const payload = sanitizeInscritoForDB(raw || {});
+  const remoteMap = getRemoteInscritoMap();
+  const rawId = raw && raw.id ? String(raw.id) : '';
+  const clubMappedId = raw && raw._clubId ? remoteMap['club_' + raw._clubId] : null;
+  let targetId = preferredId && !isTempInscritoId(preferredId) ? preferredId : null;
+  if(!targetId && rawId && remoteMap[rawId]) targetId = remoteMap[rawId];
+  if(!targetId && clubMappedId) targetId = clubMappedId;
+  if(!targetId && payload.email && payload.nombre){
+    try {
+      const q = await sb.from('inscritos').select('id').eq('email', payload.email).eq('nombre', payload.nombre).limit(1).maybeSingle();
+      if(q && q.data && q.data.id) targetId = q.data.id;
+    } catch(_){}
+  }
+
+  try {
+    let res;
+    if(targetId){
+      res = await sb.from('inscritos')
+        .update(Object.assign({}, payload, { updated_at:new Date().toISOString() }))
+        .eq('id', targetId)
+        .select('id')
+        .single();
+    } else {
+      res = await sb.from('inscritos')
+        .insert(payload)
+        .select('id')
+        .single();
+    }
+    if(res.error) return { ok:false, error:res.error, id:targetId || null };
+    const finalId = res.data && res.data.id ? res.data.id : (targetId || null);
+    if(finalId && rawId){
+      remoteMap[rawId] = finalId;
+      if(raw && raw._clubId) remoteMap['club_' + raw._clubId] = finalId;
+      setRemoteInscritoMap(remoteMap);
+    }
+    return { ok:true, error:null, id:finalId };
+  } catch(err){
+    return { ok:false, error:err, id:targetId || null };
+  }
+}
+
+const CAT_ORDER = ['Benjamín','Alevín','Infantil','Cadete','Juvenil','Junior','Senior'];
 const CAT_COLORS = {
   'Benjamín':'#f59e0b','Alevín':'#10b981','Infantil':'#3b82f6',
   'Cadete':'#8b5cf6','Juvenil':'#ec4899','Junior':'#f97316',
-  'Sub-22':'#06b6d4','Senior':'#6b7280'
+  'Senior':'#6b7280'
 };
+const PRUEBAS_EQUIPOS = ['A','B','C','D','E','F','X'];
+
+function getPruebasEquiposDisponibles(item){
+  const dep = normDeporte(item?.deporte || '');
+  const cat = getInscritoCategoria(item);
+  if(dep === 'Baloncesto' && cat === 'Senior'){
+    return ['A','B','S22A','S22B'];
+  }
+  return PRUEBAS_EQUIPOS.slice();
+}
 
 // ════════════════════════════════════════════════════════
 // AUTH
@@ -1939,7 +1992,7 @@ function syncPruebasCategoryFilterOptions(){
   const select = document.getElementById('f-cat');
   if(!select) return;
   const currentValue = select.value;
-  const visibles = [...new Set(getVisibleInscritos().map(i => i.categoria).filter(Boolean))];
+  const visibles = [...new Set(getVisibleInscritos().map(i => getInscritoCategoria(i)).filter(Boolean))];
   const options = getAllowedCategorias().length
     ? CAT_ORDER.filter(cat => visibles.includes(cat))
     : CAT_ORDER.slice();
@@ -2035,7 +2088,7 @@ function applyRoleUI() {
 async function loadInscritos() {
   const { data, error } = await sb.from('inscritos').select('*, comentarios(*)').order('fecha', { ascending: false });
   if (error) { console.error(error); return; }
-  inscritos = data || [];
+  inscritos = (data || []).map(normalizePruebasRecord);
   // Reinyectar siempre los deportistas del club y sus overrides locales
   // después de cualquier recarga desde Supabase para que no desaparezcan
   // de Lista/Kanban/Equipos al guardar un inscrito normal.
@@ -2073,13 +2126,13 @@ async function saveComentario(inscritoId, texto) {
 
   if (item && (isTempInscritoId(inscritoId) || String(inscritoId).startsWith('club_'))) {
     const payload = {
-      nombre: item.nombre || '',
+      nombre: getInscritoDisplayName(item),
       email: item.email || '',
       telefono: item.telefono || '',
       tutor: item.tutor || '',
       deporte: item.deporte || 'Baloncesto',
       genero: item.genero || 'Masculino',
-      categoria: item.categoria || '',
+      categoria: getInscritoCategoria(item) || '',
       estado: item.estado || 'Nuevo',
       equipo: item.equipo || '',
       asiste: item.asiste,
@@ -2418,6 +2471,19 @@ function parseCSVLine(line) {
   r.push(cur.trim()); return r;
 }
 
+function normalizeCsvHeader(v){
+  return String(v||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/gi,' ').trim().toLowerCase();
+}
+function findCsvColumn(headers, aliases, fallbackIndex){
+  const normHeaders = (headers||[]).map(normalizeCsvHeader);
+  const aliasList = (aliases||[]).map(normalizeCsvHeader);
+  for(const alias of aliasList){
+    const idx = normHeaders.indexOf(alias);
+    if(idx >= 0) return idx;
+  }
+  return Number.isInteger(fallbackIndex) ? fallbackIndex : -1;
+}
+
 async function syncFromSheets() {
   const btn=document.getElementById('sync-btn');
   if(btn){btn.textContent='⏳...';btn.disabled=true;}
@@ -2448,7 +2514,7 @@ async function syncFromSheets() {
       const baseRecord = {
         nombre, email, telefono, tutor, deporte,
         genero: detectarGenero(nombre),
-        categoria: calcularCategoria(nac,deporte),
+        categoria: getInscritoCategoria({deporte: deporte, categoria: calcularCategoria(nac,deporte)}),
         nacimiento: nac,
         notas, fecha,
         estado:'Nuevo', equipo:'', asiste:null, seguir:null
@@ -2503,20 +2569,47 @@ function importCSV(event) {
   const file=event.target.files[0]; if(!file) return;
   const reader=new FileReader();
   reader.onload=async (e)=>{
-    const lines=e.target.result.split('\n').map(l=>l.trim()).filter(l=>l);
+    const lines=e.target.result.split('
+').map(l=>l.trim()).filter(l=>l);
     if(lines.length<2){showToast('⚠️ CSV vacío');return;}
+
+    const headers = parseCSVLine(lines[0]);
+    const idxTimestamp = findCsvColumn(headers, ['Marca temporal','Timestamp'], 0);
+    const idxEmail = findCsvColumn(headers, ['Dirección de correo electrónico','Correo electrónico','Email'], 1);
+    const idxNombre = findCsvColumn(headers, ['Nombre y apellidos','Nombre y Apellidos del Jugador','Nombre'], 3);
+    const idxTelefono = findCsvColumn(headers, ['Teléfono','Teléfono de contacto','Telefono','Teléfono del Padre','Telefono del Padre'], 4);
+    const idxTutor = findCsvColumn(headers, ['Tutor','Nombre del padre','Nombre del tutor','Padre/Madre o tutor'], 5);
+    const idxDeporte = findCsvColumn(headers, ['Deporte'], 6);
+    const idxNacimiento = findCsvColumn(headers, ['Fecha de nacimiento','Nacimiento'], 7);
+    const idxNotas = findCsvColumn(headers, ['Observaciones','Observaciones a tener en cuenta (en caso de haberlas)','Alergias, fobias, medicaciones...'], 8);
+    const idxJugadoAnterior = findCsvColumn(headers, ['¿Has jugado anteriormente? ¿Donde?','¿Has jugado anteriormente? ¿Dónde?','Has jugado anteriormente donde','Has jugado anteriormente'], -1);
+
     const toInsert=[];
     for(let i=1;i<lines.length;i++){
       const v=parseCSVLine(lines[i]);
       const g=(idx)=>(idx>=0&&v[idx])?v[idx].trim():'';
-      const nombre=g(3); if(!nombre) continue;
-      const email=g(1);
+      const nombre=g(idxNombre); if(!nombre) continue;
+      const email=g(idxEmail);
       if(inscritos.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase()&&(x.email||'').toLowerCase()===email.toLowerCase())) continue;
       let fecha=new Date().toISOString();
-      const ts=g(0); if(ts){const p=new Date(ts);if(!isNaN(p))fecha=p.toISOString();}
-      const deporte=normDeporte(g(6));
-      const nac=g(7);
-      toInsert.push({nombre,email,telefono:g(4),tutor:g(5),deporte,genero:detectarGenero(nombre),categoria:calcularCategoria(nac,deporte),nacimiento:nac,estado:'Nuevo',equipo:'',asiste:null,notas:g(8),fecha});
+      const ts=g(idxTimestamp); if(ts){const p=new Date(ts);if(!isNaN(p))fecha=p.toISOString();}
+      const deporte=normDeporte(g(idxDeporte));
+      const nac=g(idxNacimiento);
+      toInsert.push({
+        nombre,email,
+        telefono:g(idxTelefono),
+        tutor:g(idxTutor),
+        deporte,
+        genero:detectarGenero(nombre),
+        categoria:calcularCategoria(nac,deporte),
+        nacimiento:nac,
+        estado:'Nuevo',
+        equipo:'',
+        asiste:null,
+        notas:g(idxNotas),
+        jugado_anterior:g(idxJugadoAnterior),
+        fecha
+      });
     }
     if(toInsert.length){
       await sb.from('inscritos').insert(toInsert);
@@ -3802,7 +3895,7 @@ function renderDashboard(){
   const recentHtml = recent.length?recent.map(i=>`
     <div onclick="openDetail('${i.id}')" style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--gris-claro);cursor:pointer;">
       <div style="display:flex;align-items:center;gap:9px;">
-        <div class="avatar" style="background:${CAT_COLORS[i.categoria]||'#888'}">${initials(i.nombre)}</div>
+        <div class="avatar" style="background:${CAT_COLORS[getInscritoCategoria(i)]||'#888'}">${initials(getInscritoDisplayName(i))}</div>
         <div><strong style="font-size:13px">${i.nombre}</strong><br><span style="font-size:11px;color:var(--gris-medio)">${i.deporte} · ${i.categoria} · ${i.genero}</span></div>
       </div>
       <div style="text-align:right">${badgeEstado(i.estado)}<div style="font-size:10px;color:var(--gris-medio);margin-top:2px">${fmtDate(i.fecha)}</div></div>
@@ -3821,11 +3914,13 @@ function getFiltered(){
   const cat=document.getElementById('f-cat').value;
   const est=document.getElementById('f-estado').value;
   return getVisibleInscritos().filter(i=>{
-    if(q&&!i.nombre.toLowerCase().includes(q)&&!(i.email||'').toLowerCase().includes(q)&&!(i.telefono||'').includes(q)) return false;
-    if(dep&&i.deporte!==dep) return false;
-    if(gen&&i.genero!==gen) return false;
-    if(cat&&i.categoria!==cat) return false;
-    if(est&&i.estado!==est) return false;
+    const displayName = getInscritoDisplayName(i).toLowerCase();
+    const catNorm = getInscritoCategoria(i);
+    if(q && !displayName.includes(q) && !(i.email||'').toLowerCase().includes(q) && !(i.telefono||'').includes(q)) return false;
+    if(dep && i.deporte!==dep) return false;
+    if(gen && i.genero!==gen) return false;
+    if(cat && catNorm!==cat) return false;
+    if(est && i.estado!==est) return false;
     return true;
   });
 }
@@ -3865,12 +3960,12 @@ function renderTable(){
     <tr onclick="openDetail('${i.id}')" ${i.estado==='Nuevo'?'style="background:#fff8e1;border-left:4px solid var(--amarillo);"':''}>
       <td><div class="name-cell">
         ${i.estado==='Nuevo'?'<span title="Pendiente de contactar" style="font-size:14px;margin-right:2px;">🔔</span>':''}
-        <div class="avatar" style="background:${CAT_COLORS[i.categoria]||'#888'}">${initials(i.nombre)}</div>
-        <div class="name-info"><strong>${i.nombre}</strong><span>${i.email||'—'}</span></div>
+        <div class="avatar" style="background:${CAT_COLORS[getInscritoCategoria(i)]||'#888'}">${initials(getInscritoDisplayName(i))}</div>
+        <div class="name-info"><strong>${getInscritoDisplayName(i)}</strong><span>${i.email||'—'}</span></div>
       </div></td>
       <td>${badgeDeporte(i.deporte)}</td>
       <td><span class="badge badge-${i.genero==='Femenino'?'f':'m'}">${i.genero==='Femenino'?'♀':'♂'} ${i.genero}</span></td>
-      <td><span style="font-size:12.5px;font-weight:600;color:${CAT_COLORS[i.categoria]||'#555'}">${i.categoria||'—'}</span></td>
+      <td><span style="font-size:12.5px;font-weight:600;color:${CAT_COLORS[getInscritoCategoria(i)]||'#555'}">${getInscritoCategoria(i)||'—'}</span></td>
       <td>${i.equipo?`<span class="equipo-badge">${i.equipo}</span>`:'<span style="color:var(--gris-medio);font-size:12px">—</span>'}</td>
       <td style="font-size:12.5px">${i.telefono||'—'}</td>
       <td>${badgeEstado(i.estado)}</td>
@@ -3901,7 +3996,7 @@ function renderEquipos(){
   var byCat = {};
   CAT_ORDER.forEach(function(c){ byCat[c] = []; });
   filtered.forEach(function(i){
-    var cat = i.categoria || 'Senior';
+    var cat = getInscritoCategoria(i) || 'Senior';
     if(byCat[cat]) byCat[cat].push(i);
     else byCat['Senior'].push(i);
   });
@@ -3928,7 +4023,7 @@ function renderEquipos(){
       ? '<select class="equipo-select" data-id="' + i.id + '" onclick="event.stopPropagation()" onchange="setEquipo(this.dataset.id,this.value);setTimeout(renderEquipos,400);" style="font-size:11px;">' + opts + '</select>'
       : (i.equipo ? '<span class="equipo-badge" style="background:' + eqColor + ';color:#fff;">' + i.equipo + '</span>' : '');
     return '<div class="equipos-card" data-id="' + i.id + '" onclick="openDetail(this.dataset.id)">'
-      + '<div class="avatar" style="width:34px;height:34px;font-size:12px;background:' + color + ';flex-shrink:0;">' + initials(i.nombre) + '</div>'
+      + '<div class="avatar" style="width:34px;height:34px;font-size:12px;background:' + color + ';flex-shrink:0;">' + initials(getInscritoDisplayName(i)) + '</div>'
       + '<div class="equipos-card-info">'
         + '<div class="equipos-card-name">' + i.nombre + star + '</div>'
         + '<div class="equipos-card-meta">' + badgeDeporte(i.deporte)
@@ -4006,7 +4101,7 @@ function renderKanban(){
     if(!aNew && bNew) return 1;
     return new Date(b.fecha||0) - new Date(a.fecha||0);
   });
-  filtered.forEach(i=>{const c=i.categoria||'Senior';if(cols[c])cols[c].push(i);else cols['Senior'].push(i);});
+  filtered.forEach(i=>{const c=getInscritoCategoria(i)||'Senior';if(cols[c])cols[c].push(i);else cols['Senior'].push(i);});
   const html=CAT_ORDER.filter(c=>cols[c].length>0).map(cat=>{
     return `<div class="kanban-col">
       <div class="kanban-col-header">
@@ -4037,7 +4132,7 @@ function kanbanCard(i,canEdit){
       </div>` : '';
     })()}
     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;padding-right:${!i.esDelClub?'22px':'0'};">
-      <div class="kanban-card-name">${i.nombre}</div>
+      <div class="kanban-card-name">${getInscritoDisplayName(i)}</div>
       ${i.equipo?`<span class="equipo-badge">${i.equipo}</span>`:''}
     </div>
     <div class="kanban-card-meta">
@@ -4052,7 +4147,7 @@ function kanbanCard(i,canEdit){
       ${canEdit?`<button class="asiste-btn ${asClass}" onclick="toggleAsiste('${i.id}')">${asLabel}</button>
       <select class="equipo-select" onchange="setEquipo('${i.id}',this.value)">
         <option value="">Equipo</option>
-        ${['A','B','C','D','E'].map(e=>`<option ${i.equipo===e?'selected':''}>${e}</option>`).join('')}
+        ${PRUEBAS_EQUIPOS.map(e=>`<option ${i.equipo===e?'selected':''}>${e}</option>`).join('')}
         <option value="Descartado" ${i.equipo==='Descartado'?'selected':''}>❌ Desc.</option>
       </select>`:asLabel}
       ${waNum?`<a href="https://wa.me/34${waNum}?text=${waMsg}" target="_blank" onclick="event.stopPropagation()" class="btn btn-sm btn-wa">💬 WA</a>`:''}
@@ -4068,7 +4163,7 @@ async function persistQuickInscritoChange(id, updates){
   // no con update directo por id, porque muchos no existen todavía como fila normal.
   if(i.esDelClub || String(id).startsWith('club_') || isTempInscritoId(id)) {
     const payload = {
-      nombre: i.nombre,
+      nombre: ((i.nombre || '') + (((i.esDelClub || String(id).startsWith('club_')) && i.apellidos && !(String(i.nombre||'').toLowerCase().includes(String(i.apellidos||'').toLowerCase()))) ? (' ' + i.apellidos) : '')).replace(/\s+/g,' ').trim(),
       email: i.email || '',
       telefono: i.telefono || '',
       tutor: i.tutor || '',
@@ -4086,8 +4181,13 @@ async function persistQuickInscritoChange(id, updates){
       fecha: i.fecha || new Date().toISOString()
     };
 
-    const persist = await upsertSingleInscrito(payload, (!isTempInscritoId(id) && !String(id).startsWith('club_')) ? id : null);
-    if(persist.error) return { ok:false, error:persist.error };
+    let persist = await upsertSingleInscrito(payload, (!isTempInscritoId(id) && !String(id).startsWith('club_')) ? id : null);
+    if(persist.error){
+      console.warn('upsert_inscrito_from_app falló al guardar equipo, intento directo:', persist.error);
+      const direct = await directPersistInscritoFallback(Object.assign({}, payload, { id }), (!isTempInscritoId(id) && !String(id).startsWith('club_')) ? id : null);
+      if(!direct.ok) return { ok:false, error:direct.error || persist.error };
+      persist = { error:null, id:direct.id };
+    }
 
     const clubUpdates = JSON.parse(localStorage.getItem('sv_club_updates') || '{}');
     clubUpdates[id] = Object.assign({}, clubUpdates[id] || {}, updates);
@@ -4102,8 +4202,13 @@ async function persistQuickInscritoChange(id, updates){
 
   // Inscritos normales
   const merged = Object.assign({}, i, updates, { updated_at:new Date().toISOString() });
-  const persist = await upsertSingleInscrito(merged, !isTempInscritoId(id) ? id : null);
-  if(persist.error) return { ok:false, error:persist.error };
+  let persist = await upsertSingleInscrito(merged, !isTempInscritoId(id) ? id : null);
+  if(persist.error){
+    console.warn('upsert_inscrito_from_app falló al guardar equipo, intento directo:', persist.error);
+    const direct = await directPersistInscritoFallback(merged, !isTempInscritoId(id) ? id : null);
+    if(!direct.ok) return { ok:false, error:direct.error || persist.error };
+    persist = { error:null, id:direct.id };
+  }
 
   removePendingSheetInscritoByIdentity(merged);
   await loadInscritos();
@@ -4123,39 +4228,33 @@ async function toggleAsiste(id){
 
 async function setEquipo(id,val){
   const i = inscritos.find(x => x.id === id);
-  const updates={equipo:val};
-  if(val==='Descartado') updates.estado='Descartado';
-  const res = await persistQuickInscritoChange(id, updates);
-  if(!res.ok){
-    console.error(res.error);
+  if(!i) return;
+  const updates = { equipo: val };
+  if(val === 'Descartado') updates.estado = 'Descartado';
 
-    // Fallback útil para jugadores del club / temporales: conservar el equipo en la app
-    // aunque la persistencia remota falle, evitando que el cambio se pierda visualmente.
-    if(i && (i.esDelClub || String(id).startsWith('club_') || isTempInscritoId(id))){
-      const clubUpdates = JSON.parse(localStorage.getItem('sv_club_updates') || '{}');
-      clubUpdates[id] = Object.assign({}, clubUpdates[id] || {}, updates, { updated_at:new Date().toISOString() });
-      localStorage.setItem('sv_club_updates', JSON.stringify(clubUpdates));
-      Object.assign(i, updates);
-      renderView();
-      renderDashboard();
-      showToast('⚠️ No se ha guardado en base de datos. Solo en este navegador');
+  const merged = normalizePruebasRecord(Object.assign({}, i, updates, {
+    nombre: getInscritoDisplayName(i),
+    categoria: getInscritoCategoria(i),
+    jugado_anterior: i.jugado_anterior || i.jugadoAnterior || i.jugadoAnteriorDonde || '',
+    updated_at: new Date().toISOString()
+  }));
+
+  let direct = await directPersistInscritoFallback(merged, (!isTempInscritoId(id) && !String(id).startsWith('club_')) ? id : null);
+  if(!direct.ok){
+    console.warn('Guardado directo de equipo falló, intento RPC:', direct.error);
+    const persist = await upsertSingleInscrito(merged, (!isTempInscritoId(id) && !String(id).startsWith('club_')) ? id : null);
+    if(persist.error){
+      console.error(persist.error);
+      showToast('❌ No se ha podido guardar el equipo en base de datos');
       return;
     }
-
-    // Fallback para inscritos aún no consolidados
-    if(i){
-      const merged = Object.assign({}, i, updates, { updated_at:new Date().toISOString(), _syncPending:true });
-      savePendingSheetInscrito(merged);
-      Object.assign(i, updates);
-      renderView();
-      renderDashboard();
-      showToast('⚠️ No se ha guardado en base de datos. Solo en este navegador');
-      return;
-    }
-
-    showToast('❌ No se ha podido guardar el equipo');
-    return;
   }
+
+  removePendingSheetInscritoByIdentity(merged);
+  await loadInscritos();
+  mergeSocios();
+  renderView();
+  renderDashboard();
   showToast('✅ Equipo guardado');
 }
 
@@ -4169,12 +4268,12 @@ function openDetail(id){
   const canEdit=currentPerfil?.rol!=='invitado';
   const waNum=(i.telefono||'').replace(/\D/g,'');
   const comentarios=i.comentarios||[];
-  document.getElementById('modal-title').textContent=i.nombre;
+  document.getElementById('modal-title').textContent=((i.nombre || '') + (i.apellidos && !(String(i.nombre||'').toLowerCase().includes(String(i.apellidos||'').toLowerCase())) ? (' ' + i.apellidos) : '')).replace(/\s+/g,' ').trim();
   document.getElementById('modal-body').innerHTML=`
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--gris-claro)">
-      <div class="avatar" style="width:50px;height:50px;font-size:18px;font-weight:900;background:${CAT_COLORS[i.categoria]||'#888'}">${initials(i.nombre)}</div>
+      <div class="avatar" style="width:50px;height:50px;font-size:18px;font-weight:900;background:${CAT_COLORS[getInscritoCategoria(i)]||'#888'}">${initials(getInscritoDisplayName(i))}</div>
       <div style="flex:1">
-        <div style="font-size:15px;font-weight:700">${i.nombre}</div>
+        <div style="font-size:15px;font-weight:700">${getInscritoDisplayName(i)}</div>
         <div style="font-size:12px;color:var(--gris-medio)">${i.email||''}${i.telefono?' · '+i.telefono:''}</div>
         ${i.tutor?`<div style="font-size:11.5px;color:var(--gris-medio)">👨‍👩‍👦 ${i.tutor}</div>`:''}
         <div style="margin-top:5px;display:flex;gap:4px;flex-wrap:wrap">
@@ -4209,7 +4308,7 @@ function openDetail(id){
     </div>
     <div class="detail-row">
       <div class="detail-field"><label>Categoría</label>
-        <select id="e-categoria">${CAT_ORDER.map(c=>`<option ${i.categoria===c?'selected':''}>${c}</option>`).join('')}</select>
+        <select id="e-categoria">${CAT_ORDER.map(c=>`<option ${(getInscritoCategoria(i)===c)?'selected':''}>${c}</option>`).join('')}</select>
       </div>
       <div class="detail-field"><label>Estado</label>
         <select id="e-estado">${['Nuevo','Contactado','Confirmado','Descartado'].map(e=>`<option ${i.estado===e?'selected':''}>${e}</option>`).join('')}</select>
@@ -4219,7 +4318,7 @@ function openDetail(id){
       <div class="detail-field"><label>Equipo</label>
         <select id="e-equipo">
           <option value="" ${!i.equipo?'selected':''}>Sin asignar</option>
-          ${['A','B','C','D','E'].map(e=>`<option ${i.equipo===e?'selected':''}>${e}</option>`).join('')}
+          ${getPruebasEquiposDisponibles(i).map(e=>`<option ${i.equipo===e?'selected':''}>${e}</option>`).join('')}
           <option value="Descartado" ${i.equipo==='Descartado'?'selected':''}>❌ Descartado</option>
         </select>
       </div>
@@ -4297,32 +4396,39 @@ async function saveEdit(){
     estado:      getVal('e-estado')    || i.estado,
     equipo:      equiVal !== null ? equiVal : i.equipo,
     asiste:      av===''?null:av==='true',
-    seguir:      getVal('e-seguir') !== null ? (getVal('e-seguir') || null) : (i.seguir || null)
+    seguir:      getVal('e-seguir') !== null ? (getVal('e-seguir') || null) : (i.seguir || null),
+    jugado_anterior: getVal('e-jugado-anterior') !== null ? getVal('e-jugado-anterior').trim() : (i.jugado_anterior || i.jugadoAnterior || i.jugadoAnteriorDonde || '')
   };
   const btn = document.querySelector('#modal-footer .btn-primary');
   if(btn){ btn.textContent='⏳ Guardando...'; btn.disabled=true; }
 
   if(i.esDelClub || String(editingId).startsWith('club_')) {
     const payload = {
-      nombre:    i.nombre,
+      nombre:    getInscritoDisplayName(i),
       email:     i.email    || '',
       telefono:  updates.telefono !== undefined ? updates.telefono : (i.telefono || ''),
       tutor:     i.tutor    || '',
       deporte:   updates.deporte   || i.deporte,
       genero:    updates.genero    || i.genero,
-      categoria: updates.categoria || i.categoria,
+      categoria: updates.categoria || getInscritoCategoria(i),
       estado:    updates.estado    || i.estado,
       equipo:    updates.equipo    !== undefined ? updates.equipo : (i.equipo || ''),
       asiste:    updates.asiste    !== undefined ? updates.asiste : i.asiste,
       seguir:    updates.seguir    !== undefined ? updates.seguir : (i.seguir || null),
+      jugado_anterior: updates.jugado_anterior !== undefined ? updates.jugado_anterior : (i.jugado_anterior || i.jugadoAnterior || i.jugadoAnteriorDonde || ''),
       nacimiento:i.nacimiento || '',
       notas:     i.notas     || '',
       esDelClub: true,
       equipoClub:i.equipoClub || '',
       fecha:     i.fecha || new Date().toISOString()
     };
-    const persist = await upsertSingleInscrito(payload, (!isTempInscritoId(editingId) && !String(editingId).startsWith('club_')) ? editingId : null);
-    if(persist.error){ showToast('❌ Error al guardar: ' + persist.error.message); console.error(persist.error); if(btn){ btn.textContent='💾 Guardar'; btn.disabled=false; } return; }
+    let persist = await upsertSingleInscrito(payload, (!isTempInscritoId(editingId) && !String(editingId).startsWith('club_')) ? editingId : null);
+    if(persist.error){
+      console.warn('upsert_inscrito_from_app falló en guardar ficha, intento directo:', persist.error);
+      const direct = await directPersistInscritoFallback(Object.assign({}, payload, { id: editingId }), (!isTempInscritoId(editingId) && !String(editingId).startsWith('club_')) ? editingId : null);
+      if(!direct.ok){ showToast('❌ Error al guardar: ' + ((direct.error&&direct.error.message)||persist.error.message||'error')); console.error(direct.error||persist.error); if(btn){ btn.textContent='💾 Guardar'; btn.disabled=false; } return; }
+      persist = { error:null, id:direct.id };
+    }
     const clubUpdates = JSON.parse(localStorage.getItem('sv_club_updates') || '{}');
     clubUpdates[editingId] = Object.assign({}, (clubUpdates[editingId]||{}), updates);
     localStorage.setItem('sv_club_updates', JSON.stringify(clubUpdates));
@@ -4335,13 +4441,18 @@ async function saveEdit(){
   }
 
   const merged = Object.assign({}, i, updates, { telefono: updates.telefono, updated_at:new Date().toISOString() });
-  const persist = await upsertSingleInscrito(merged, !isTempInscritoId(editingId) ? editingId : null);
+  let persist = await upsertSingleInscrito(merged, !isTempInscritoId(editingId) ? editingId : null);
   if(persist.error){
-    savePendingSheetInscrito(Object.assign({}, merged, { _syncPending:true }));
-    showToast('⚠️ Guardado pendiente en este navegador. Revisa Supabase.');
-    console.error(persist.error);
-    if(btn){ btn.textContent='💾 Guardar'; btn.disabled=false; }
-    return;
+    console.warn('upsert_inscrito_from_app falló en guardar ficha, intento directo:', persist.error);
+    const direct = await directPersistInscritoFallback(merged, !isTempInscritoId(editingId) ? editingId : null);
+    if(!direct.ok){
+      savePendingSheetInscrito(Object.assign({}, merged, { _syncPending:true }));
+      showToast('⚠️ Guardado pendiente en este navegador. Revisa Supabase.');
+      console.error(direct.error || persist.error);
+      if(btn){ btn.textContent='💾 Guardar'; btn.disabled=false; }
+      return;
+    }
+    persist = { error:null, id:direct.id };
   }
 
   removePendingSheetInscritoByIdentity(merged);
@@ -4439,14 +4550,13 @@ function renderPruebas(){
     'Infantil Masculino':'#3b82f6','Infantil Femenino':'#ec4899',
     'Cadete Masculino':'#8b5cf6','Cadete Femenino':'#8b5cf6',
     'Junior Masculino':'#f97316','Junior Femenino':'#f97316',
-    'Sub-22':'#06b6d4',
     'Senior Masculino':'#6b7280','Senior Femenino':'#6b7280'
   };
 
   const ALL_CATS = [
     'Benjamín Masculino','Benjamín Femenino','Alevín Masculino','Alevín Femenino',
     'Infantil Masculino','Infantil Femenino','Cadete Masculino','Cadete Femenino',
-    'Junior Masculino','Junior Femenino','Sub-22','Senior Masculino','Senior Femenino'
+    'Junior Masculino','Junior Femenino','Senior Masculino','Senior Femenino'
   ];
 
   // Load from localStorage or use defaults
@@ -4457,7 +4567,7 @@ function renderPruebas(){
         {hora:'17:00', equipos:['Benjamín Masculino','Alevín Masculino','Infantil Masculino']},
         {hora:'18:30', equipos:['Cadete Masculino']},
         {hora:'20:00', equipos:['Junior Masculino']},
-        {hora:'21:30', equipos:['Sub-22','Senior Masculino']},
+        {hora:'21:30', equipos:['Senior Masculino']},
       ]
     },
     {
@@ -4490,9 +4600,9 @@ function renderPruebas(){
             <div style="flex:1;display:flex;flex-wrap:wrap;gap:5px;align-items:center;">
               ${ses.equipos.map((e, ei) => {
                 const parts = e.split(' ');
-                const genero = parts[parts.length-1]; // Masculino/Femenino
-                const catName = parts.slice(0,-1).join(' '); // Benjamín, Alevín...
-                const count = inscritos.filter(i=>i.categoria===catName && i.genero===genero).length;
+                const genero = parts[parts.length-1];
+                const catName = parts.slice(0,-1).join(' ');
+                const count = inscritos.filter(i=>getInscritoCategoria(i)===catName && i.genero===genero).length;
                 return `
                 <span style="background:${CAT_COLORS_BAL[e]||'#888'};color:#fff;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700;display:inline-flex;align-items:center;gap:4px;cursor:pointer;transition:opacity 0.15s;"
                   onclick="goToKanban('${catName}','${genero === 'Sub-22' ? 'Masculino' : genero}')"
@@ -4692,6 +4802,30 @@ function normDeporte(val){
   if(v.includes('fut')||v.includes('fút'))return 'Fútbol';
   if(v.includes('balon')||v.includes('basket'))return 'Baloncesto';
   return val.charAt(0).toUpperCase()+val.slice(1);
+}
+
+function getInscritoDisplayName(i){
+  const nombre = String(i?.nombre || '').trim();
+  const apellidos = String(i?.apellidos || '').trim();
+  if(apellidos && nombre && !nombre.toLowerCase().includes(apellidos.toLowerCase())) return (nombre + ' ' + apellidos).replace(/\s+/g,' ').trim();
+  return nombre || apellidos || '—';
+}
+function getInscritoCategoria(i){
+  const dep = normDeporte(i?.deporte || '');
+  const cat = String(i?.categoria || '').trim();
+  if(dep === 'Baloncesto' && (cat === 'Sub-22' || cat === 'S22')) return 'Senior';
+  return cat;
+}
+function normalizePruebasRecord(i){
+  if(!i || typeof i !== 'object') return i;
+  const out = Object.assign({}, i);
+  const displayName = getInscritoDisplayName(out);
+  if(displayName) out.nombre = displayName;
+  out.categoria = getInscritoCategoria(out);
+  if(out.jugado_anterior === undefined || out.jugado_anterior === null){
+    out.jugado_anterior = out.jugadoAnterior || out.jugadoAnteriorDonde || '';
+  }
+  return out;
 }
 
 function initials(name){return(name||'?').split(' ').slice(0,2).map(n=>n[0]).join('').toUpperCase();}
@@ -6244,13 +6378,21 @@ const DEPORTISTAS_CLUB = [{"id": 10000, "nombre": "GABRIEL", "apellidos": "", "e
 // Merge club players into inscritos view on load
 function mergeSocios() {
   const clubUpdates = JSON.parse(localStorage.getItem('sv_club_updates') || '{}');
-  const fullName = (item) => normalizeText([item?.nombre || '', item?.apellidos || ''].join(' ').trim());
+  const fullNameText = (item) => [item?.nombre || '', item?.apellidos || ''].join(' ').replace(/\s+/g,' ').trim();
+  const fullName = (item) => normalizeText(fullNameText(item));
   const phoneKey = (item) => normalizePhone(item?.telefono || '');
 
   DEPORTISTAS_CLUB.forEach(d => {
     const clubId = 'club_' + d.id;
     const savedUpdates = clubUpdates[clubId] || {};
-    const enrichedClub = Object.assign({}, d, savedUpdates, { _clubId: d.id, id: clubId, esDelClub: true });
+    const enrichedClub = Object.assign({}, d, savedUpdates, {
+      _clubId: d.id,
+      id: clubId,
+      esDelClub: true
+    });
+    const clubDisplayName = fullNameText(d) || d.nombre || '';
+    if(clubDisplayName) enrichedClub.nombre = clubDisplayName;
+
     const clubName = fullName(enrichedClub);
     const clubPhone = phoneKey(enrichedClub);
 
@@ -6267,16 +6409,20 @@ function mergeSocios() {
       existing.esDelClub = true;
       existing.equipoClub = existing.equipoClub || d.equipoClub || '';
       existing.apellidos = existing.apellidos || d.apellidos || '';
+      if((existing.nombre || '').trim() === (d.nombre || '').trim() && d.apellidos) {
+        existing.nombre = clubDisplayName;
+      }
       if(!existing.telefono && enrichedClub.telefono) existing.telefono = enrichedClub.telefono;
       if(!existing.nacimiento && enrichedClub.nacimiento) existing.nacimiento = enrichedClub.nacimiento;
       if(!existing.categoria && enrichedClub.categoria) existing.categoria = enrichedClub.categoria;
       if(!existing.deporte && enrichedClub.deporte) existing.deporte = enrichedClub.deporte;
       if(!existing.genero && enrichedClub.genero) existing.genero = enrichedClub.genero;
       Object.assign(existing, savedUpdates || {});
+      Object.assign(existing, normalizePruebasRecord(existing));
       return;
     }
 
-    inscritos.push(enrichedClub);
+    inscritos.push(normalizePruebasRecord(enrichedClub));
   });
 }
 
@@ -6397,9 +6543,9 @@ function renderMensajes() {
   loadMensajes();
   // Add default group channels if not present
   var grupoCanalId = 'grupo_general';
-  var equiposCanalIds = ['A','B','C','D','E'].map(function(e){ return 'grupo_equipo_'+e; });
+  var equiposCanalIds = PRUEBAS_EQUIPOS.map(function(e){ return 'grupo_equipo_'+e; });
   var defaultConvs = [{ id: grupoCanalId, tipo: 'grupo', nombre: '📢 Canal General', icono: '📢' }];
-  ['A','B','C','D','E'].forEach(function(eq){
+  getPruebasEquiposDisponibles({deporte:fDep,genero:fGen,categoria:fCat}).forEach(function(eq){
     defaultConvs.push({ id: 'grupo_equipo_'+eq, tipo: 'grupo', nombre: '🏅 Equipo '+eq, icono: '🏅' });
   });
   defaultConvs.forEach(function(dc){
