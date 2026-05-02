@@ -1688,6 +1688,7 @@ function sanitizeInscritoForDB(raw){
     asiste: raw && raw.asiste !== undefined ? raw.asiste : null,
     nacimiento: raw && raw.nacimiento || '',
     notas: raw && raw.notas || '',
+    jugado_anterior: raw && (raw.jugado_anterior || raw.jugadoAnterior || raw.jugadoAnteriorDonde) || '',
     fecha: normalizeInscritoFechaForDB(raw && raw.fecha)
   };
   Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k]);
@@ -1735,6 +1736,48 @@ async function upsertSingleInscrito(raw, preferredId){
     if(rpc.error) return { data:null, error: rpc.error, action:'error', id: targetId || null };
   } catch(rpcErr){
     return { data:null, error: rpcErr, action:'error', id: targetId || null };
+  }
+}
+
+async function directPersistInscritoFallback(raw, preferredId){
+  const payload = sanitizeInscritoForDB(raw || {});
+  const remoteMap = getRemoteInscritoMap();
+  const rawId = raw && raw.id ? String(raw.id) : '';
+  const clubMappedId = raw && raw._clubId ? remoteMap['club_' + raw._clubId] : null;
+  let targetId = preferredId && !isTempInscritoId(preferredId) ? preferredId : null;
+  if(!targetId && rawId && remoteMap[rawId]) targetId = remoteMap[rawId];
+  if(!targetId && clubMappedId) targetId = clubMappedId;
+  if(!targetId && payload.email && payload.nombre){
+    try {
+      const q = await sb.from('inscritos').select('id').eq('email', payload.email).eq('nombre', payload.nombre).limit(1).maybeSingle();
+      if(q && q.data && q.data.id) targetId = q.data.id;
+    } catch(_){}
+  }
+
+  try {
+    let res;
+    if(targetId){
+      res = await sb.from('inscritos')
+        .update(Object.assign({}, payload, { updated_at:new Date().toISOString() }))
+        .eq('id', targetId)
+        .select('id')
+        .single();
+    } else {
+      res = await sb.from('inscritos')
+        .insert(payload)
+        .select('id')
+        .single();
+    }
+    if(res.error) return { ok:false, error:res.error, id:targetId || null };
+    const finalId = res.data && res.data.id ? res.data.id : (targetId || null);
+    if(finalId && rawId){
+      remoteMap[rawId] = finalId;
+      if(raw && raw._clubId) remoteMap['club_' + raw._clubId] = finalId;
+      setRemoteInscritoMap(remoteMap);
+    }
+    return { ok:true, error:null, id:finalId };
+  } catch(err){
+    return { ok:false, error:err, id:targetId || null };
   }
 }
 
@@ -2418,6 +2461,19 @@ function parseCSVLine(line) {
   r.push(cur.trim()); return r;
 }
 
+function normalizeCsvHeader(v){
+  return String(v||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/gi,' ').trim().toLowerCase();
+}
+function findCsvColumn(headers, aliases, fallbackIndex){
+  const normHeaders = (headers||[]).map(normalizeCsvHeader);
+  const aliasList = (aliases||[]).map(normalizeCsvHeader);
+  for(const alias of aliasList){
+    const idx = normHeaders.indexOf(alias);
+    if(idx >= 0) return idx;
+  }
+  return Number.isInteger(fallbackIndex) ? fallbackIndex : -1;
+}
+
 async function syncFromSheets() {
   const btn=document.getElementById('sync-btn');
   if(btn){btn.textContent='⏳...';btn.disabled=true;}
@@ -2503,20 +2559,47 @@ function importCSV(event) {
   const file=event.target.files[0]; if(!file) return;
   const reader=new FileReader();
   reader.onload=async (e)=>{
-    const lines=e.target.result.split('\n').map(l=>l.trim()).filter(l=>l);
+    const lines=e.target.result.split('
+').map(l=>l.trim()).filter(l=>l);
     if(lines.length<2){showToast('⚠️ CSV vacío');return;}
+
+    const headers = parseCSVLine(lines[0]);
+    const idxTimestamp = findCsvColumn(headers, ['Marca temporal','Timestamp'], 0);
+    const idxEmail = findCsvColumn(headers, ['Dirección de correo electrónico','Correo electrónico','Email'], 1);
+    const idxNombre = findCsvColumn(headers, ['Nombre y apellidos','Nombre y Apellidos del Jugador','Nombre'], 3);
+    const idxTelefono = findCsvColumn(headers, ['Teléfono','Teléfono de contacto','Telefono','Teléfono del Padre','Telefono del Padre'], 4);
+    const idxTutor = findCsvColumn(headers, ['Tutor','Nombre del padre','Nombre del tutor','Padre/Madre o tutor'], 5);
+    const idxDeporte = findCsvColumn(headers, ['Deporte'], 6);
+    const idxNacimiento = findCsvColumn(headers, ['Fecha de nacimiento','Nacimiento'], 7);
+    const idxNotas = findCsvColumn(headers, ['Observaciones','Observaciones a tener en cuenta (en caso de haberlas)','Alergias, fobias, medicaciones...'], 8);
+    const idxJugadoAnterior = findCsvColumn(headers, ['¿Has jugado anteriormente? ¿Donde?','¿Has jugado anteriormente? ¿Dónde?','Has jugado anteriormente donde','Has jugado anteriormente'], -1);
+
     const toInsert=[];
     for(let i=1;i<lines.length;i++){
       const v=parseCSVLine(lines[i]);
       const g=(idx)=>(idx>=0&&v[idx])?v[idx].trim():'';
-      const nombre=g(3); if(!nombre) continue;
-      const email=g(1);
+      const nombre=g(idxNombre); if(!nombre) continue;
+      const email=g(idxEmail);
       if(inscritos.find(x=>x.nombre.toLowerCase()===nombre.toLowerCase()&&(x.email||'').toLowerCase()===email.toLowerCase())) continue;
       let fecha=new Date().toISOString();
-      const ts=g(0); if(ts){const p=new Date(ts);if(!isNaN(p))fecha=p.toISOString();}
-      const deporte=normDeporte(g(6));
-      const nac=g(7);
-      toInsert.push({nombre,email,telefono:g(4),tutor:g(5),deporte,genero:detectarGenero(nombre),categoria:calcularCategoria(nac,deporte),nacimiento:nac,estado:'Nuevo',equipo:'',asiste:null,notas:g(8),fecha});
+      const ts=g(idxTimestamp); if(ts){const p=new Date(ts);if(!isNaN(p))fecha=p.toISOString();}
+      const deporte=normDeporte(g(idxDeporte));
+      const nac=g(idxNacimiento);
+      toInsert.push({
+        nombre,email,
+        telefono:g(idxTelefono),
+        tutor:g(idxTutor),
+        deporte,
+        genero:detectarGenero(nombre),
+        categoria:calcularCategoria(nac,deporte),
+        nacimiento:nac,
+        estado:'Nuevo',
+        equipo:'',
+        asiste:null,
+        notas:g(idxNotas),
+        jugado_anterior:g(idxJugadoAnterior),
+        fecha
+      });
     }
     if(toInsert.length){
       await sb.from('inscritos').insert(toInsert);
@@ -4086,8 +4169,13 @@ async function persistQuickInscritoChange(id, updates){
       fecha: i.fecha || new Date().toISOString()
     };
 
-    const persist = await upsertSingleInscrito(payload, (!isTempInscritoId(id) && !String(id).startsWith('club_')) ? id : null);
-    if(persist.error) return { ok:false, error:persist.error };
+    let persist = await upsertSingleInscrito(payload, (!isTempInscritoId(id) && !String(id).startsWith('club_')) ? id : null);
+    if(persist.error){
+      console.warn('upsert_inscrito_from_app falló al guardar equipo, intento directo:', persist.error);
+      const direct = await directPersistInscritoFallback(Object.assign({}, payload, { id }), (!isTempInscritoId(id) && !String(id).startsWith('club_')) ? id : null);
+      if(!direct.ok) return { ok:false, error:direct.error || persist.error };
+      persist = { error:null, id:direct.id };
+    }
 
     const clubUpdates = JSON.parse(localStorage.getItem('sv_club_updates') || '{}');
     clubUpdates[id] = Object.assign({}, clubUpdates[id] || {}, updates);
@@ -4102,8 +4190,13 @@ async function persistQuickInscritoChange(id, updates){
 
   // Inscritos normales
   const merged = Object.assign({}, i, updates, { updated_at:new Date().toISOString() });
-  const persist = await upsertSingleInscrito(merged, !isTempInscritoId(id) ? id : null);
-  if(persist.error) return { ok:false, error:persist.error };
+  let persist = await upsertSingleInscrito(merged, !isTempInscritoId(id) ? id : null);
+  if(persist.error){
+    console.warn('upsert_inscrito_from_app falló al guardar equipo, intento directo:', persist.error);
+    const direct = await directPersistInscritoFallback(merged, !isTempInscritoId(id) ? id : null);
+    if(!direct.ok) return { ok:false, error:direct.error || persist.error };
+    persist = { error:null, id:direct.id };
+  }
 
   removePendingSheetInscritoByIdentity(merged);
   await loadInscritos();
@@ -4297,7 +4390,8 @@ async function saveEdit(){
     estado:      getVal('e-estado')    || i.estado,
     equipo:      equiVal !== null ? equiVal : i.equipo,
     asiste:      av===''?null:av==='true',
-    seguir:      getVal('e-seguir') !== null ? (getVal('e-seguir') || null) : (i.seguir || null)
+    seguir:      getVal('e-seguir') !== null ? (getVal('e-seguir') || null) : (i.seguir || null),
+    jugado_anterior: getVal('e-jugado-anterior') !== null ? getVal('e-jugado-anterior').trim() : (i.jugado_anterior || i.jugadoAnterior || i.jugadoAnteriorDonde || '')
   };
   const btn = document.querySelector('#modal-footer .btn-primary');
   if(btn){ btn.textContent='⏳ Guardando...'; btn.disabled=true; }
@@ -4315,14 +4409,20 @@ async function saveEdit(){
       equipo:    updates.equipo    !== undefined ? updates.equipo : (i.equipo || ''),
       asiste:    updates.asiste    !== undefined ? updates.asiste : i.asiste,
       seguir:    updates.seguir    !== undefined ? updates.seguir : (i.seguir || null),
+      jugado_anterior: updates.jugado_anterior !== undefined ? updates.jugado_anterior : (i.jugado_anterior || i.jugadoAnterior || i.jugadoAnteriorDonde || ''),
       nacimiento:i.nacimiento || '',
       notas:     i.notas     || '',
       esDelClub: true,
       equipoClub:i.equipoClub || '',
       fecha:     i.fecha || new Date().toISOString()
     };
-    const persist = await upsertSingleInscrito(payload, (!isTempInscritoId(editingId) && !String(editingId).startsWith('club_')) ? editingId : null);
-    if(persist.error){ showToast('❌ Error al guardar: ' + persist.error.message); console.error(persist.error); if(btn){ btn.textContent='💾 Guardar'; btn.disabled=false; } return; }
+    let persist = await upsertSingleInscrito(payload, (!isTempInscritoId(editingId) && !String(editingId).startsWith('club_')) ? editingId : null);
+    if(persist.error){
+      console.warn('upsert_inscrito_from_app falló en guardar ficha, intento directo:', persist.error);
+      const direct = await directPersistInscritoFallback(Object.assign({}, payload, { id: editingId }), (!isTempInscritoId(editingId) && !String(editingId).startsWith('club_')) ? editingId : null);
+      if(!direct.ok){ showToast('❌ Error al guardar: ' + ((direct.error&&direct.error.message)||persist.error.message||'error')); console.error(direct.error||persist.error); if(btn){ btn.textContent='💾 Guardar'; btn.disabled=false; } return; }
+      persist = { error:null, id:direct.id };
+    }
     const clubUpdates = JSON.parse(localStorage.getItem('sv_club_updates') || '{}');
     clubUpdates[editingId] = Object.assign({}, (clubUpdates[editingId]||{}), updates);
     localStorage.setItem('sv_club_updates', JSON.stringify(clubUpdates));
@@ -4335,13 +4435,18 @@ async function saveEdit(){
   }
 
   const merged = Object.assign({}, i, updates, { telefono: updates.telefono, updated_at:new Date().toISOString() });
-  const persist = await upsertSingleInscrito(merged, !isTempInscritoId(editingId) ? editingId : null);
+  let persist = await upsertSingleInscrito(merged, !isTempInscritoId(editingId) ? editingId : null);
   if(persist.error){
-    savePendingSheetInscrito(Object.assign({}, merged, { _syncPending:true }));
-    showToast('⚠️ Guardado pendiente en este navegador. Revisa Supabase.');
-    console.error(persist.error);
-    if(btn){ btn.textContent='💾 Guardar'; btn.disabled=false; }
-    return;
+    console.warn('upsert_inscrito_from_app falló en guardar ficha, intento directo:', persist.error);
+    const direct = await directPersistInscritoFallback(merged, !isTempInscritoId(editingId) ? editingId : null);
+    if(!direct.ok){
+      savePendingSheetInscrito(Object.assign({}, merged, { _syncPending:true }));
+      showToast('⚠️ Guardado pendiente en este navegador. Revisa Supabase.');
+      console.error(direct.error || persist.error);
+      if(btn){ btn.textContent='💾 Guardar'; btn.disabled=false; }
+      return;
+    }
+    persist = { error:null, id:direct.id };
   }
 
   removePendingSheetInscritoByIdentity(merged);
