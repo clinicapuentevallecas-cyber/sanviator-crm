@@ -630,6 +630,10 @@ pre,code{white-space:pre-wrap;}
   .cp-card{padding:12px!important;}
   .cp-card > div:first-child{gap:12px!important;}
   .cp-card img{width:72px!important;height:72px!important;}
+  .cp-avatar-wrap{display:block!important;overflow:hidden!important;border-radius:50%!important;isolation:isolate;}
+  .cp-avatar-img{display:block!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;object-fit:cover!important;object-position:center!important;border-radius:50%!important;transform:translateZ(0);}
+  .cp-avatar-fallback{display:flex!important;width:100%!important;height:100%!important;border-radius:50%!important;}
+
   .cp-name{font-size:15px!important;line-height:1.05!important;}
   .cp-meta{font-size:13px!important;line-height:1.35!important;}
   .cp-badges{gap:6px!important;}
@@ -2304,6 +2308,7 @@ function openAddUserModal() {
         <select id="nu-rol" onchange="toggleNuPermisos(this.value)">
           <option value="invitado">Invitado</option>
           <option value="entrenador">Entrenador</option>
+          <option value="monitor">Monitor campus</option>
           <option value="admin">Administrador</option>
           <option value="jugador">Jugador</option>
         </select>
@@ -2327,6 +2332,16 @@ function openAddUserModal() {
         </label>`).join('')}
       </div>
     </div>
+    <div id="nu-categorias-box" style="margin-top:12px;border:1.5px solid var(--gris-claro);border-radius:10px;padding:14px;background:var(--gris-bg);display:none;">
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;font-weight:700;color:var(--gris-medio);margin-bottom:10px;">🏷️ Categorías permitidas</div>
+      <p style="font-size:12px;color:var(--gris-medio);margin-bottom:10px;">Déjalo vacío para que tenga acceso a todas las categorías permitidas por su rol.</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:7px;">
+        ${PRUEBAS_CATEGORIAS_PERMISOS.concat(CAMPUS_CATEGORIAS).map((c,idx)=>`<label style="display:flex;align-items:center;gap:8px;padding:8px 10px;border:1.5px solid var(--gris-claro);border-radius:7px;cursor:pointer;background:var(--blanco);">
+          <input type="checkbox" value="${c}" id="nu-cat-${idx}" style="accent-color:var(--amarillo);width:15px;height:15px;">
+          <div style="font-size:12.5px;font-weight:600;">${c}</div>
+        </label>`).join('')}
+      </div>
+    </div>
     <p style="font-size:12.5px;color:var(--gris-medio);margin-top:10px;background:#fffbe6;padding:10px;border-radius:6px;">
       💡 La contraseña por defecto es <strong>SanviPruebas@</strong>. El usuario podrá cambiarla después.
     </p>`;
@@ -2334,12 +2349,21 @@ function openAddUserModal() {
     <button class="btn btn-secondary" onclick="closeModal()">Cancelar</button>
     <button class="btn btn-primary" onclick="createUser()">Crear usuario</button>`;
   document.getElementById('modal-overlay').classList.add('open');
+  toggleNuPermisos(document.getElementById('nu-rol')?.value || 'invitado');
 }
 
 function toggleNuPermisos(rol) {
   const box = document.getElementById('nu-permisos-box');
-  if (!box) return;
-  box.style.display = rol === 'admin' ? 'none' : 'block';
+  const catBox = document.getElementById('nu-categorias-box');
+  if (box) box.style.display = rol === 'admin' ? 'none' : 'block';
+  if (catBox) catBox.style.display = (rol === 'entrenador' || rol === 'monitor' || rol === 'jugador') ? 'block' : 'none';
+  if (rol === 'monitor') {
+    MODULOS_DISPONIBLES.forEach((m,idx) => {
+      const el = document.getElementById('nu-mod-'+idx);
+      if (!el) return;
+      el.checked = (m === 'Campus Salamanca');
+    });
+  }
 }
 
 async function createUser() {
@@ -2353,7 +2377,14 @@ async function createUser() {
   if (pass !== pass2) { showToast('⚠️ Las contraseñas no coinciden'); return; }
 
   // Recoger módulos seleccionados
-  const modulos_permitidos = MODULOS_DISPONIBLES.map((m,idx) => document.getElementById('nu-mod-'+idx)).filter(el => el && el.checked).map(el => el.value);
+  let modulos_permitidos = MODULOS_DISPONIBLES.map((m,idx) => document.getElementById('nu-mod-'+idx)).filter(el => el && el.checked).map(el => el.value);
+  const categorias_permitidas = PRUEBAS_CATEGORIAS_PERMISOS.concat(CAMPUS_CATEGORIAS)
+    .map((c,idx) => ({ c, el: document.getElementById('nu-cat-'+idx) }))
+    .filter(item => item.el && item.el.checked)
+    .map(item => item.c);
+  if (rol === 'monitor' && !modulos_permitidos.includes('Campus Salamanca')) {
+    modulos_permitidos = ['Campus Salamanca'];
+  }
 
   const btn = document.querySelector('#modal-footer .btn-primary');
   if(btn) { btn.textContent = '⏳ Creando...'; btn.disabled = true; }
@@ -2373,7 +2404,13 @@ async function createUser() {
 
   // Step 2: Try to get userId — may be null if email confirmation is required
   const userId = signUpData?.user?.id;
-  const profileData = { email, nombre, rol, modulos_permitidos: modulos_permitidos.length ? modulos_permitidos : null, categorias_permitidas: null };
+  const profileData = {
+    email,
+    nombre,
+    rol,
+    modulos_permitidos: modulos_permitidos.length ? modulos_permitidos : null,
+    categorias_permitidas: categorias_permitidas.length ? categorias_permitidas : null
+  };
 
   if (userId) {
     // User created and confirmed immediately — upsert full profile
@@ -2383,24 +2420,40 @@ async function createUser() {
     );
     if (e2) console.warn('Profile upsert warning:', e2.message);
     // Force role in case trigger set it to invitado
-    await sb.from('perfiles').update({ rol, nombre, modulos_permitidos: profileData.modulos_permitidos }).eq('id', userId);
+    await sb.from('perfiles').update({
+      rol,
+      nombre,
+      modulos_permitidos: profileData.modulos_permitidos,
+      categorias_permitidas: profileData.categorias_permitidas
+    }).eq('id', userId);
   } else {
     // Email confirmation pending — store pending profile in localStorage
     const pending = JSON.parse(localStorage.getItem('sv_pending_users') || '{}');
-    pending[email] = { nombre, rol, modulos_permitidos: profileData.modulos_permitidos };
+    pending[email] = {
+      nombre,
+      rol,
+      modulos_permitidos: profileData.modulos_permitidos,
+      categorias_permitidas: profileData.categorias_permitidas
+    };
     localStorage.setItem('sv_pending_users', JSON.stringify(pending));
     // Also try upsert by email in case profile already exists
     await sb.from('perfiles').upsert({ ...profileData }, { onConflict: 'email' });
   }
 
-  setPermOverride([userId, email], { nombre, rol, modulos_permitidos: profileData.modulos_permitidos, categorias_permitidas: null });
+  setPermOverride([userId, email], {
+    nombre,
+    rol,
+    modulos_permitidos: profileData.modulos_permitidos,
+    categorias_permitidas: profileData.categorias_permitidas
+  });
   if(btn) { btn.textContent = 'Crear usuario'; btn.disabled = false; }
   closeModal();
   await loadUsers();
   const modsMsg = modulos_permitidos.length ? ` · Módulos: ${modulos_permitidos.join(', ')}` : '';
+  const catsMsg = categorias_permitidas.length ? ` · Categorías: ${categorias_permitidas.join(', ')}` : '';
   const msg = userId
-    ? `✅ ${nombre||email} creado como ${rol}${modsMsg}. Ya puede entrar.`
-    : `✅ ${nombre||email} creado${modsMsg}. Si no llega email de confirmación, el usuario puede entrar directamente con SanviPruebas@`;
+    ? `✅ ${nombre||email} creado como ${rol}${modsMsg}${catsMsg}. Ya puede entrar.`
+    : `✅ ${nombre||email} creado${modsMsg}${catsMsg}. Si no llega email de confirmación, el usuario puede entrar directamente con SanviPruebas@`;
   showToast(msg, 6000);
 }
 
@@ -3739,6 +3792,24 @@ const TITLES={dashboard:'Principal',inscritos:'Pruebas · Inscritos',usuarios:'A
 const MODULOS_DISPONIBLES = ['Pruebas Temporada','Campus Salamanca','3X3 San Viator','Campus Madrid','Tecnificación','Escuela','Mensajes','Administración'];
 const PRUEBAS_CATEGORIAS_PERMISOS = ['Benjamín Fútbol','Benjamín masculino Baloncesto','Benjamín femenino Baloncesto','Alevín Fútbol','Alevín masculino Baloncesto','Alevín femenino Baloncesto','Infantil Fútbol','Infantil masculino Baloncesto','Infantil femenino Baloncesto','Cadete Fútbol','Cadete masculino Baloncesto','Cadete femenino Baloncesto','Juvenil Fútbol','Junior masculino Baloncesto','Junior femenino Baloncesto','Aficionado Fútbol','S22 Masculino Baloncesto','Senior masculino Baloncesto','Senior femenino Baloncesto'];
 const CAMPUS_CATEGORIAS = ['Basket 1','Basket 2','Basket 3','Basket 4','Basket 5','Basket 6','Minibasket','Fútbol 1','Fútbol 2','Fútbol 3'];
+function getCampusParticipantPhoto(participant){
+  if(!participant) return '';
+  try {
+    const saved = JSON.parse(localStorage.getItem('sv_campus_photos') || '{}');
+    if(saved && saved[participant.id]) return String(saved[participant.id]);
+  } catch(_){}
+  if(participant.foto) return String(participant.foto);
+  if(typeof CAMPUS_PHOTOS_PRELOAD !== 'undefined' && CAMPUS_PHOTOS_PRELOAD && CAMPUS_PHOTOS_PRELOAD[String(participant.id)]) {
+    return String(CAMPUS_PHOTOS_PRELOAD[String(participant.id)]);
+  }
+  return '';
+}
+function getCampusParticipantInitials(participant){
+  const n = participant?.nombre?.[0] || '';
+  const a = participant?.apellidos?.[0] || '';
+  return `${n}${a}`;
+}
+
 function showPanel(name){
   const guard = {inscritos:'Pruebas Temporada',pruebas:'Pruebas Temporada',integracion:'Pruebas Temporada',campus:'Campus Salamanca',tresx3:'3X3 San Viator',mensajes:'Mensajes',usuarios:'Administración',modulos:'Administración'};
   if(guard[name] && !hasModuloAccess(guard[name]) && currentPerfil?.rol!=='admin' && currentPerfil?.rol!=='jugador') { showToast('⛔ No tienes acceso a ese módulo'); return; }
@@ -5493,12 +5564,14 @@ function renderCampusParticipants() {
     const hasAlergia = p.alergias && p.alergias.length > 2 && !['ninguna','no','nada','nan',''].some(x => p.alergias.toLowerCase().trim() === x);
     const campusEquipoActual = getCampusEquipo(p.id, p.equipo);
     const color = CAMPUS_EQUIPO_COLORS[campusEquipoActual] || '#888';
+    const fotoSrc = getCampusParticipantPhoto(p);
+    const initials = getCampusParticipantInitials(p);
     return `<div class="cp-card" onclick="openCampusDetail(${p.id})">
       <div style="display:flex;gap:10px;align-items:flex-start;">
-        <div style="width:46px;height:46px;border-radius:50%;overflow:hidden;flex-shrink:0;border:2px solid ${color};">
-          ${p.foto
-            ? `<img src="${p.foto}" style="width:100%;height:100%;object-fit:cover;" onerror="this.parentElement.innerHTML='<div style=\'width:100%;height:100%;background:${color};color:#fff;font-family:Barlow Condensed,sans-serif;font-size:14px;font-weight:900;display:flex;align-items:center;justify-content:center;\'>${(p.nombre[0]||'')+(p.apellidos[0]||'')}</div>'">`
-            : `<div style="width:100%;height:100%;background:${color};color:#fff;font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:900;display:flex;align-items:center;justify-content:center;">${(p.nombre[0]||'')+(p.apellidos[0]||'')}</div>`}
+        <div class="cp-avatar-wrap" style="width:46px;height:46px;border-radius:50%;overflow:hidden;flex-shrink:0;border:2px solid ${color};background:${color};">
+          ${fotoSrc
+            ? `<img class="cp-avatar-img" src="${fotoSrc}" loading="lazy" decoding="async" referrerpolicy="no-referrer" style="display:block;width:100%;height:100%;object-fit:cover;object-position:center;" onerror="this.outerHTML='<div class=\'cp-avatar-fallback\' style=\'width:100%;height:100%;background:${color};color:#fff;font-family:Barlow Condensed,sans-serif;font-size:14px;font-weight:900;display:flex;align-items:center;justify-content:center;\'>${initials}</div>'">`
+            : `<div class="cp-avatar-fallback" style="width:100%;height:100%;background:${color};color:#fff;font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:900;display:flex;align-items:center;justify-content:center;">${initials}</div>`}
         </div>
         <div style="flex:1;">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;">
@@ -5607,9 +5680,15 @@ function openCampusDetail(id) {
   const pagado = p.cuota1 + p.cuota2 + p.cuota3 + p.cuota4;
   const pendiente = p.total - pagado;
   document.getElementById('modal-title').textContent = `${p.nombre} ${p.apellidos}`;
+  const photoSrc = getCampusParticipantPhoto(p);
+  const initials = getCampusParticipantInitials(p);
   document.getElementById('modal-body').innerHTML = `
     <div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--gris-claro);">
-      <div style="width:50px;height:50px;border-radius:50%;background:${color};color:#fff;font-family:'Barlow Condensed',sans-serif;font-size:18px;font-weight:900;display:flex;align-items:center;justify-content:center;">${(p.nombre[0]||'')+(p.apellidos[0]||'')}</div>
+      <div style="width:50px;height:50px;border-radius:50%;overflow:hidden;flex-shrink:0;border:2px solid ${color};background:${color};">
+        ${photoSrc
+          ? `<img src="${photoSrc}" loading="lazy" decoding="async" referrerpolicy="no-referrer" style="display:block;width:100%;height:100%;object-fit:cover;object-position:center;" onerror="this.outerHTML='<div style=\'width:100%;height:100%;background:${color};color:#fff;font-family:Barlow Condensed,sans-serif;font-size:18px;font-weight:900;display:flex;align-items:center;justify-content:center;\'>${initials}</div>'">`
+          : `<div style="width:100%;height:100%;background:${color};color:#fff;font-family:'Barlow Condensed',sans-serif;font-size:18px;font-weight:900;display:flex;align-items:center;justify-content:center;">${initials}</div>`}
+      </div>
       <div>
         <div style="font-size:16px;font-weight:700;">${p.nombre} ${p.apellidos}</div>
         <div style="font-size:12px;color:var(--gris-medio);">${p.tipo}</div>
@@ -9229,6 +9308,16 @@ function openAddUserModal() {
         ${MODULOS_DISPONIBLES.map((m,idx)=>`<label style="display:flex;align-items:center;gap:10px;padding:9px 12px;border:1.5px solid var(--gris-claro);border-radius:7px;cursor:pointer;background:var(--blanco);">
           <input type="checkbox" value="${m}" id="nu-mod-${idx}" style="accent-color:var(--amarillo);width:15px;height:15px;">
           <div><div style="font-size:13px;font-weight:600;">${m}</div></div>
+        </label>`).join('')}
+      </div>
+    </div>
+    <div id="nu-categorias-box" style="margin-top:12px;border:1.5px solid var(--gris-claro);border-radius:10px;padding:14px;background:var(--gris-bg);display:none;">
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;font-weight:700;color:var(--gris-medio);margin-bottom:10px;">🏷️ Categorías permitidas</div>
+      <p style="font-size:12px;color:var(--gris-medio);margin-bottom:10px;">Déjalo vacío para que tenga acceso a todas las categorías permitidas por su rol.</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:7px;">
+        ${PRUEBAS_CATEGORIAS_PERMISOS.concat(CAMPUS_CATEGORIAS).map((c,idx)=>`<label style="display:flex;align-items:center;gap:8px;padding:8px 10px;border:1.5px solid var(--gris-claro);border-radius:7px;cursor:pointer;background:var(--blanco);">
+          <input type="checkbox" value="${c}" id="nu-cat-${idx}" style="accent-color:var(--amarillo);width:15px;height:15px;">
+          <div style="font-size:12.5px;font-weight:600;">${c}</div>
         </label>`).join('')}
       </div>
     </div>
